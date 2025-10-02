@@ -165,9 +165,6 @@ public class FlutterPcmSoundPlugin implements
                         mSamples.put(chunk);
                     }
                     
-                    // REMOVED: The feed method should not implicitly resume playback.
-                    // This is now handled exclusively by the 'start' method.
-
                     result.success(true);
                     break;
                 }
@@ -206,7 +203,7 @@ public class FlutterPcmSoundPlugin implements
         } catch (Exception e) {
             StringWriter sw = new StringWriter();
             PrintWriter pw = new PrintWriter(sw);
-            e.printStackTrace(pw);
+e.printStackTrace(pw);
             String stackTrace = sw.toString();
             result.error("androidException", e.toString(), stackTrace);
             return;
@@ -251,13 +248,18 @@ public class FlutterPcmSoundPlugin implements
         while (!mShouldCleanup) {
             ByteBuffer data = null;
             try {
-                data = mSamples.take();
+                // MODIFIED: Use poll() instead of take() to avoid blocking indefinitely.
+                // This allows the loop to continuously check the isPlaying flag.
+                data = mSamples.poll(10, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 continue;
             }
 
-            mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
+            // MODIFIED: Only write data if we are in the 'playing' state.
+            if (data != null && isPlaying) {
+                mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
+            }
 
             long remaining = mRemainingFrames();
             boolean isThresholdEvent = remaining <= mFeedThreshold && !mDidInvokeFeedCallback;
