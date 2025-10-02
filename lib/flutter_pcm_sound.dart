@@ -1,6 +1,7 @@
-import 'dart:math' as math;
 import 'dart:async';
+import 'dart:math' as math show pi, cos;
 import 'dart:typed_data';
+
 import 'package:flutter/services.dart';
 
 enum LogLevel {
@@ -10,22 +11,13 @@ enum LogLevel {
   verbose,
 }
 
-// Apple Documentation: https://developer.apple.com/documentation/avfaudio/avaudiosessioncategory
-enum IosAudioCategory {
-  soloAmbient, // same as ambient, but other apps will be muted. Other apps will be muted.
-  ambient, // same as soloAmbient, but other apps are not muted.
-  playback, // audio will play when phone is locked, like the music app
-  playAndRecord //
-}
-
 class FlutterPcmSound {
-  static const MethodChannel _channel = const MethodChannel('flutter_pcm_sound/methods');
+  static const MethodChannel _channel =
+      const MethodChannel('flutter_pcm_sound/methods');
 
   static Function(int)? onFeedSamplesCallback;
 
   static LogLevel _logLevel = LogLevel.standard;
-
-  static bool _needsStart = true;
 
   /// set log level
   static Future<void> setLogLevel(LogLevel level) async {
@@ -34,33 +26,31 @@ class FlutterPcmSound {
   }
 
   /// setup audio
-  /// 'avAudioCategory' is for iOS only,
-  /// enabled by default on other platforms
-  static Future<void> setup(
-      {required int sampleRate,
-      required int channelCount,
-      IosAudioCategory iosAudioCategory = IosAudioCategory.playback,
-      bool iosAllowBackgroundAudio = false,
-      }) async {
+  static Future<void> setup({
+    required int sampleRate,
+    required int channelCount,
+    bool iosAllowBackgroundAudio =
+        false, // This is still relevant for the native side
+  }) async {
     return await _invokeMethod('setup', {
       'sample_rate': sampleRate,
       'num_channels': channelCount,
-      'ios_audio_category': iosAudioCategory.name,
-      'ios_allow_background_audio' : iosAllowBackgroundAudio,
+      'ios_allow_background_audio': iosAllowBackgroundAudio,
     });
   }
 
   /// queue 16-bit samples (little endian)
   static Future<void> feed(PcmArrayInt16 buffer) async {
-    if (_needsStart && buffer.count != 0) _needsStart = false;
-    return await _invokeMethod('feed', {'buffer': buffer.bytes.buffer.asUint8List()});
+    return await _invokeMethod(
+        'feed', {'buffer': buffer.bytes.buffer.asUint8List()});
   }
 
   /// set the threshold at which we call the
   /// feed callback. i.e. if we have less than X
   /// queued frames, the feed callback will be invoked
   static Future<void> setFeedThreshold(int threshold) async {
-    return await _invokeMethod('setFeedThreshold', {'feed_threshold': threshold});
+    return await _invokeMethod(
+        'setFeedThreshold', {'feed_threshold': threshold});
   }
 
   /// callback is invoked when the audio buffer
@@ -70,16 +60,16 @@ class FlutterPcmSound {
     _channel.setMethodCallHandler(_methodCallHandler);
   }
 
-  /// convenience function:
-  ///   * if needed, invokes your feed callback to start playback
-  ///   * returns true if your callback was invoked
-  static bool start() {
-    if (_needsStart && onFeedSamplesCallback != null) {
-      onFeedSamplesCallback!(0);
-      return true;
-    } else {
-      return false;
-    }
+  /// Starts or resumes the audio engine on the native side.
+  /// This will begin the process of the native side calling the feed callback.
+  static Future<void> start() async {
+    return await _invokeMethod('start');
+  }
+
+  /// Stops (pauses) the audio engine on the native side.
+  /// This will stop the native side from calling the feed callback, saving resources.
+  static Future<void> stop() async {
+    return await _invokeMethod('stop');
   }
 
   /// release all audio resources
@@ -93,7 +83,8 @@ class FlutterPcmSound {
       if (method == 'feed') {
         Uint8List data = arguments['buffer'];
         if (data.lengthInBytes > 6) {
-          args = '(${data.lengthInBytes ~/ 2} samples) ${data.sublist(0, 6)} ...';
+          args =
+              '(${data.lengthInBytes ~/ 2} samples) ${data.sublist(0, 6)} ...';
         } else {
           args = '(${data.lengthInBytes ~/ 2} samples) $data';
         }
@@ -114,7 +105,6 @@ class FlutterPcmSound {
     switch (call.method) {
       case 'OnFeedSamples':
         int remainingFrames = call.arguments["remaining_frames"];
-        _needsStart = remainingFrames == 0;
         if (onFeedSamplesCallback != null) {
           onFeedSamplesCallback!(remainingFrames);
         }
@@ -169,7 +159,16 @@ class MajorScale {
 
   // C Major Scale (Just Intonation)
   List<double> get scale {
-    List<double> c = [261.63, 294.33, 327.03, 348.83, 392.44, 436.05, 490.55, 523.25];
+    List<double> c = [
+      261.63,
+      294.33,
+      327.03,
+      348.83,
+      392.44,
+      436.05,
+      490.55,
+      523.25
+    ];
     return [c[0]] + c + c.reversed.toList().sublist(0, c.length - 1);
   }
 
@@ -202,14 +201,20 @@ class MajorScale {
   }
 
   // generate a sine wave
-  List<int> cosineWave({int periods = 1, int sampleRate = 44100, double freq = 440, double volume = 0.5}) {
+  List<int> cosineWave(
+      {int periods = 1,
+      int sampleRate = 44100,
+      double freq = 440,
+      double volume = 0.5}) {
     final period = 1.0 / freq;
     final nFramesPerPeriod = (period * sampleRate).toInt();
     final totalFrames = nFramesPerPeriod * periods;
     final step = math.pi * 2 / nFramesPerPeriod;
     List<int> data = List.filled(totalFrames, 0);
     for (int i = 0; i < totalFrames; i++) {
-      data[i] = (math.cos(step * (i % nFramesPerPeriod)) * volume * 32768).toInt() - 16384;
+      data[i] =
+          (math.cos(step * (i % nFramesPerPeriod)) * volume * 32768).toInt() -
+              16384;
     }
     return data;
   }
@@ -223,7 +228,11 @@ class MajorScale {
     List<int> frames = [];
     for (int i = 0; i < periods; i++) {
       _periodCount %= _periodsForScale;
-      frames += cosineWave(periods: 1, sampleRate: sampleRate, freq: scale[noteIdx], volume: volume);
+      frames += cosineWave(
+          periods: 1,
+          sampleRate: sampleRate,
+          freq: scale[noteIdx],
+          volume: volume);
       _periodCount++;
     }
     return frames;

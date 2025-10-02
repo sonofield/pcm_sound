@@ -6,7 +6,7 @@
 #endif
 
 #define kOutputBus 0
-#define NAMESPACE @"flutter_pcm_sound" // Assuming this is the namespace you want
+#define NAMESPACE @"flutter_pcm_sound"
 
 typedef NS_ENUM(NSUInteger, LogLevel) {
     none = 0,
@@ -21,13 +21,15 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 @property(nonatomic) LogLevel mLogLevel;
 @property(nonatomic) AudioComponentInstance mAudioUnit;
 @property(nonatomic) NSMutableData *mSamples;
-@property(nonatomic) int mNumChannels; 
-@property(nonatomic) int mFeedThreshold; 
-@property(nonatomic) bool mDidInvokeFeedCallback; 
+@property(nonatomic) int mNumChannels;
+@property(nonatomic) int mFeedThreshold;
+@property(nonatomic) bool mDidInvokeFeedCallback;
 @property(nonatomic) bool mDidSendZero;
 @property(nonatomic) bool mDidSetup;
 @property(nonatomic) BOOL mIsAppActive;
 @property(nonatomic) BOOL mAllowBackgroundAudio;
+@property(nonatomic) BOOL _isPlaying;
+
 @end
 
 @implementation FlutterPcmSoundPlugin
@@ -86,47 +88,11 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             NSNumber *sampleRate       = args[@"sample_rate"];
             NSNumber *numChannels      = args[@"num_channels"];
 #if TARGET_OS_IOS
-            NSString *iosAudioCategory = args[@"ios_audio_category"];
+            // We still read this value, but session management is now external.
             self.mAllowBackgroundAudio = [args[@"ios_allow_background_audio"] boolValue];
 #endif
 
             self.mNumChannels = [numChannels intValue];
-
-#if TARGET_OS_IOS
-            // iOS audio category
-            AVAudioSessionCategory category = AVAudioSessionCategorySoloAmbient;
-            if ([iosAudioCategory isEqualToString:@"ambient"]) {
-                category = AVAudioSessionCategoryAmbient;
-            } else if ([iosAudioCategory isEqualToString:@"soloAmbient"]) {
-                category = AVAudioSessionCategorySoloAmbient;
-            } else if ([iosAudioCategory isEqualToString:@"playback"]) {
-                category = AVAudioSessionCategoryPlayback;
-            }
-            else if ([iosAudioCategory isEqualToString:@"playAndRecord"]) {
-                category = AVAudioSessionCategoryPlayAndRecord;
-            }
-            
-            // Set the AVAudioSession category based on the string value
-            NSError *error = nil;
-            [[AVAudioSession sharedInstance] setCategory:category error:&error];
-            if (error) {
-                NSLog(@"Error setting AVAudioSession category: %@", error);
-                result([FlutterError errorWithCode:@"AVAudioSessionError" 
-                                        message:@"Error setting AVAudioSession category" 
-                                        details:[error localizedDescription]]);
-                return;
-            }
-            
-            // Activate the audio session
-            [[AVAudioSession sharedInstance] setActive:YES error:&error];
-            if (error) {
-                NSLog(@"Error activating AVAudioSession: %@", error);
-                result([FlutterError errorWithCode:@"AVAudioSessionError" 
-                                        message:@"Error activating AVAudioSession" 
-                                        details:[error localizedDescription]]);
-                return;
-            }
-#endif
 
             // cleanup
             if (_mAudioUnit != nil) {
@@ -202,6 +168,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             }
 
             self.mDidSetup = true;
+            self._isPlaying = NO; // MODIFIED: Initialize playing state.
             
             result(@YES);
         }
@@ -213,11 +180,6 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 return;
             }
 
-            // If background audio is not allowed, feeding immediately after a lock→unlock
-            // can cause AudioOutputUnitStart to fail with 561015905 because the app is not
-            // fully active yet. Rather than surfacing this transient error, we report success
-            // and tell Dart the frames were consumed, prompting it to continue feeding.
-            // This hides the temporary failure and keeps the API simple.
             if (!self.mIsAppActive && !self.mAllowBackgroundAudio) {
                 @synchronized (self.mSamples) {[self.mSamples setLength:0];}
                 [self.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:@{@"remaining_frames": @(0)}];
@@ -243,7 +205,31 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
                 return;
             }
+            // MODIFIED: Update playing state when feed starts the unit.
+            self._isPlaying = YES;
 
+            result(@YES);
+        }
+        // ADDED: New 'start' method to resume playback.
+        else if ([@"start" isEqualToString:call.method])
+        {
+            if (self.mAudioUnit != nil && !self._isPlaying) {
+                OSStatus status = AudioOutputUnitStart(self.mAudioUnit);
+                if (status == noErr) {
+                    self._isPlaying = YES;
+                }
+            }
+            result(@YES);
+        }
+        // ADDED: New 'stop' method to pause playback.
+        else if ([@"stop" isEqualToString:call.method])
+        {
+            if (self.mAudioUnit != nil && self._isPlaying) {
+                OSStatus status = AudioOutputUnitStop(self.mAudioUnit);
+                if (status == noErr) {
+                    self._isPlaying = NO;
+                }
+            }
             result(@YES);
         }
         else if ([@"setFeedThreshold" isEqualToString:call.method])
@@ -280,9 +266,10 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         AudioComponentInstanceDispose(_mAudioUnit);
         _mAudioUnit = nil;
         self.mDidSetup = false;
+        self._isPlaying = NO; // MODIFIED: Reset playing state on cleanup.
     }
     @synchronized (self.mSamples) {
-        self.mSamples = [NSMutableData new]; 
+        self.mSamples = [NSMutableData new];
     }
 }
 
@@ -306,12 +293,12 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             if (status != noErr) {
                 NSLog(@"AudioOutputUnitStop failed. OSStatus: %@", @(status));
             } else {
+                self._isPlaying = NO; // MODIFIED: Update state when buffer underrun stops the unit.
                 NSLog(@"AudioUnit stopped because no more samples");
             }
         }
     }
 }
-
 
 static OSStatus RenderCallback(void *inRefCon,
                                AudioUnitRenderActionFlags *ioActionFlags,
@@ -326,7 +313,6 @@ static OSStatus RenderCallback(void *inRefCon,
     BOOL isThresholdEvent = false;
 
     @synchronized (instance.mSamples) {
-
         // clear
         memset(ioData->mBuffers[0].mData, 0, ioData->mBuffers[0].mDataByteSize);
 
@@ -354,7 +340,7 @@ static OSStatus RenderCallback(void *inRefCon,
 
     BOOL isZeroCrossingEvent = instance.mDidSendZero == false && remainingFrames == 0;
 
-    if (isThresholdEvent || isZeroCrossingEvent) { 
+    if (isThresholdEvent || isZeroCrossingEvent) {
         instance.mDidInvokeFeedCallback = true;
         instance.mDidSendZero = remainingFrames == 0;
         NSDictionary *response = @{@"remaining_frames": @(remainingFrames)};
@@ -365,6 +351,5 @@ static OSStatus RenderCallback(void *inRefCon,
 
     return noErr;
 }
-
 
 @end
