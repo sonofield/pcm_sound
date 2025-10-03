@@ -302,8 +302,9 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
 
             long remaining = mRemainingFrames();
             boolean isThresholdEvent = remaining <= mFeedThreshold && !mDidInvokeFeedCallback;
-            // Only trigger callbacks if we are actually playing
-            boolean isZeroCrossingEvent = mDidSendZero == false && remaining == 0 && isPlaying;
+            // Always trigger callbacks when queue is empty, regardless of playing state
+            // This ensures synth service can prepare data even when stopped
+            boolean isZeroCrossingEvent = mDidSendZero == false && remaining == 0;
             
             if (isThresholdEvent || isZeroCrossingEvent) {
                 mDidInvokeFeedCallback = true;
