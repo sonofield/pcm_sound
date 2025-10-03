@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 
@@ -31,7 +33,7 @@ class _PcmSoundAppState extends State<PcmSoundApp> {
     super.initState();
     FlutterPcmSound.setLogLevel(LogLevel.verbose);
     FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: 1);
-    FlutterPcmSound.setFeedThreshold(sampleRate~/20);
+    FlutterPcmSound.setFeedThreshold(sampleRate ~/ 20);
     FlutterPcmSound.setFeedCallback(onFeed);
   }
 
@@ -46,7 +48,7 @@ class _PcmSoundAppState extends State<PcmSoundApp> {
     });
     if (stopFeeding == false) {
       List<int> frames = scale.generate(periods: 20);
-      await FlutterPcmSound.feed(PcmArrayInt16.fromList(frames));
+      await FlutterPcmSound.feed(Int16List.fromList(frames));
     }
   }
 
