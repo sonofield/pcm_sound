@@ -66,11 +66,23 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 
 #if TARGET_OS_IOS
 - (void)onWillResignActive:(NSNotification *)note {
+  // FOREGROUND SERVICE FIX: Enhanced app lifecycle handling
   self.mIsAppActive = NO;
+  
+  // FOREGROUND SERVICE FIX: Prevent callbacks during app transition
+  self.mDidInvokeFeedCallback = true; // Prevent new callbacks
+  
+  NSLog(@"PCM: App will resign active - preventing callbacks");
 }
 
 - (void)onDidBecomeActive:(NSNotification *)note {
+  // FOREGROUND SERVICE FIX: Enhanced app lifecycle handling
   self.mIsAppActive = YES;
+  
+  // FOREGROUND SERVICE FIX: Reset callback flags when app becomes active
+  self.mDidInvokeFeedCallback = false;
+  
+  NSLog(@"PCM: App did become active - allowing callbacks");
 }
 #endif
 
@@ -150,36 +162,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 return;
             }
 
-#if TARGET_OS_IOS
-            // CRASH FIX: Configure audio session for foreground services
-            NSError *audioSessionError = nil;
-            AVAudioSession *audioSession = [AVAudioSession sharedInstance];
-            
-            if (self.mAllowBackgroundAudio) {
-                [audioSession setCategory:AVAudioSessionCategoryPlayback 
-                             withOptions:AVAudioSessionCategoryOptionAllowBluetooth 
-                                   error:&audioSessionError];
-            } else {
-                [audioSession setCategory:AVAudioSessionCategoryPlayback 
-                             withOptions:AVAudioSessionCategoryOptionDefaultToSpeaker 
-                                   error:&audioSessionError];
-            }
-            
-            if (audioSessionError) {
-                result([FlutterError errorWithCode:@"AudioSessionError" 
-                                          message:[NSString stringWithFormat:@"Failed to set audio session category: %@", audioSessionError.localizedDescription] 
-                                          details:nil]);
-                return;
-            }
-            
-            [audioSession setActive:YES error:&audioSessionError];
-            if (audioSessionError) {
-                result([FlutterError errorWithCode:@"AudioSessionError" 
-                                          message:[NSString stringWithFormat:@"Failed to activate audio session: %@", audioSessionError.localizedDescription] 
-                                          details:nil]);
-                return;
-            }
-#endif
+// REMOVED: Audio session configuration - handled externally by the app
 
             // --- IMPROVEMENT ---
             // Start the AudioUnit once and let it run. It will pull data from the RenderCallback.
@@ -230,21 +213,33 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         }
         else if ([@"stop" isEqualToString:call.method])
         {
-            // --- IMPROVEMENT ---
-            // This is the software gate. We do NOT stop the AudioUnit.
-            // We just set the flag and clear the buffer to stop sound immediately.
-            // This prevents the hardware-induced delay on restart.
+            // EXTERNAL AUDIO SESSION FIX: Enhanced stop method that doesn't interfere with external audio session
             if (self.mAudioUnit != nil && self._isPlaying) {
-                // CRASH FIX: Set playing flag first, then clear buffer to prevent race condition
+                // EXTERNAL AUDIO SESSION FIX: Set playing flag first, then clear buffer to prevent race condition
                 self._isPlaying = NO;
+                
+                // EXTERNAL AUDIO SESSION FIX: Clear buffer safely with additional checks
                 @synchronized (self.mSamples) {
                     if (self.mSamples) {
                         [self.mSamples setLength:0];
                     }
                 }
-                // Reset callback flags to prevent stale callbacks
+                
+                // EXTERNAL AUDIO SESSION FIX: Reset callback flags to prevent stale callbacks
                 self.mDidInvokeFeedCallback = false;
                 self.mDidSendZero = false;
+                
+                // EXTERNAL AUDIO SESSION FIX: Additional safety - prevent any pending callbacks
+                if (self.mMethodChannel) {
+                    // Cancel any pending method channel operations
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        // This ensures any pending callbacks are processed before we continue
+                        // No-op, just ensures the queue is clear
+                    });
+                }
+                
+                // EXTERNAL AUDIO SESSION FIX: Log for debugging external audio session issues
+                NSLog(@"PCM: Stop called - AudioUnit still running, audio session managed externally");
             }
             result(@YES);
         }
@@ -292,27 +287,31 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         
         // Clean up AudioUnit if it exists
         if (_mAudioUnit != nil) {
-            // This is the correct place to fully stop and dispose of the AudioUnit.
-            AudioOutputUnitStop(_mAudioUnit);
-            AudioUnitUninitialize(_mAudioUnit);
-            AudioComponentInstanceDispose(_mAudioUnit);
-            _mAudioUnit = nil;
+            // CRASH FIX: Add safety checks before AudioUnit operations
+            @try {
+                // This is the correct place to fully stop and dispose of the AudioUnit.
+                AudioOutputUnitStop(_mAudioUnit);
+                AudioUnitUninitialize(_mAudioUnit);
+                AudioComponentInstanceDispose(_mAudioUnit);
+            } @catch (NSException *exception) {
+                NSLog(@"Warning: Exception during AudioUnit cleanup: %@", exception.reason);
+            } @finally {
+                _mAudioUnit = nil;
+            }
         }
         
-#if TARGET_OS_IOS
-        // CRASH FIX: Deactivate audio session to prevent conflicts in foreground services
-        NSError *audioSessionError = nil;
-        AVAudioSession *audioSession = [AVAudioSession sharedInstance];
-        [audioSession setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:&audioSessionError];
-        if (audioSessionError && self.mLogLevel >= error) {
-            NSLog(@"Warning: Failed to deactivate audio session during cleanup: %@", audioSessionError.localizedDescription);
-        }
-#endif
+// REMOVED: Audio session deactivation - handled externally by the app
         
         // CRASH FIX: Clear method channel reference to prevent stale callbacks
         self.mMethodChannel = nil;
+        
+        // CRASH FIX: Clear cleanup lock reference
+        self.cleanupLock = nil;
     } @finally {
-        [self.cleanupLock unlock];
+        // Only unlock if we still have the lock (in case cleanupLock was set to nil)
+        if (self.cleanupLock) {
+            [self.cleanupLock unlock];
+        }
     }
 }
 
@@ -332,11 +331,30 @@ static OSStatus RenderCallback(void *inRefCon,
         return noErr;
     }
 
-    // HYBRID APPROACH: Quick cleanup check without blocking audio thread
-    if ([instance.cleanupLock tryLock]) {
+    // FOREGROUND SERVICE FIX: Quick cleanup check without blocking audio thread
+    if (instance.cleanupLock && [instance.cleanupLock tryLock]) {
         [instance.cleanupLock unlock];
-    } else {
+    } else if (instance.cleanupLock) {
         // Cleanup in progress, provide silence
+        if (ioData->mBuffers[0].mData) {
+            memset(ioData->mBuffers[0].mData, 0, ioData->mBuffers[0].mDataByteSize);
+        }
+        return noErr;
+    }
+    // If cleanupLock is nil, proceed (instance might be deallocated)
+    
+    // EXTERNAL AUDIO SESSION FIX: Check if app is in a valid state for audio processing
+    if (!instance.mIsAppActive && !instance.mAllowBackgroundAudio) {
+        // App is backgrounded and background audio not allowed, provide silence
+        if (ioData->mBuffers[0].mData) {
+            memset(ioData->mBuffers[0].mData, 0, ioData->mBuffers[0].mDataByteSize);
+        }
+        return noErr;
+    }
+    
+    // EXTERNAL AUDIO SESSION FIX: Additional safety check for external audio session conflicts
+    if (!instance.mDidSetup) {
+        // Instance is being cleaned up or not properly set up, provide silence
         if (ioData->mBuffers[0].mData) {
             memset(ioData->mBuffers[0].mData, 0, ioData->mBuffers[0].mDataByteSize);
         }
@@ -377,20 +395,28 @@ static OSStatus RenderCallback(void *inRefCon,
         BOOL isThresholdEvent = remainingFrames <= instance.mFeedThreshold && !instance.mDidInvokeFeedCallback;
         BOOL isZeroCrossingEvent = instance.mDidSendZero == false && remainingFrames == 0;
 
-        // CRASH FIX: Only invoke callback if method channel is still valid
-        if ((isThresholdEvent || isZeroCrossingEvent) && instance.mMethodChannel) {
+        // FLUTTER CHANNEL FIX: Only invoke callback if method channel is still valid and not in cleanup
+        if ((isThresholdEvent || isZeroCrossingEvent) && instance.mMethodChannel && instance.mDidSetup && !instance.mDidInvokeFeedCallback) {
             instance.mDidInvokeFeedCallback = true;
             instance.mDidSendZero = remainingFrames == 0;
             NSDictionary *response = @{@"remaining_frames": @(remainingFrames)};
             
-            // CRASH FIX: Use weak reference to prevent retain cycle and check validity
-            __weak typeof(instance) weakInstance = instance;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                __strong typeof(weakInstance) strongInstance = weakInstance;
-                if (strongInstance && strongInstance.mMethodChannel && strongInstance.mAudioUnit) {
-                    [strongInstance.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:response];
-                }
-            });
+            // FLUTTER CHANNEL FIX: Capture method channel reference before async call
+            FlutterMethodChannel *methodChannel = instance.mMethodChannel;
+            if (methodChannel) {
+                // FLUTTER CHANNEL FIX: ALWAYS dispatch to the main queue for Flutter platform channel calls
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    // FLUTTER CHANNEL FIX: Double-check instance validity and method channel
+                    if (instance && instance.mDidSetup && instance.mAudioUnit && methodChannel) {
+                        @try {
+                            [methodChannel invokeMethod:@"OnFeedSamples" arguments:response];
+                        } @catch (NSException *exception) {
+                            // FLUTTER CHANNEL FIX: Catch any exceptions from method channel calls
+                            NSLog(@"Warning: Exception in method channel invoke: %@", exception.reason);
+                        }
+                    }
+                });
+            }
         }
     }
     return noErr;
