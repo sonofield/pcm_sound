@@ -7,7 +7,6 @@ import android.media.AudioTrack;
 import android.media.AudioAttributes;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
 
 import androidx.annotation.NonNull;
 
@@ -16,7 +15,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.io.StringWriter;
 import java.io.PrintWriter;
 import java.nio.ByteBuffer;
@@ -26,10 +24,14 @@ import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 
-public class FlutterPcmSoundPlugin implements
-    FlutterPlugin,
-    MethodChannel.MethodCallHandler
-{
+/**
+ * FlutterPcmSoundPlugin implements a reliable PCM sound playback mechanism
+ * with start/stop control for musical applications.
+ * 
+ * This version keeps the AudioTrack always active to avoid re-initialization delays,
+ * but uses blocking queue operations to eliminate polling delays.
+ */
+public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.MethodCallHandler {
     private static final String CHANNEL_NAME = "flutter_pcm_sound/methods";
     private static final int MAX_FRAMES_PER_BUFFER = 200;
 
@@ -42,15 +44,17 @@ public class FlutterPcmSoundPlugin implements
     private int mNumChannels;
     private int mMinBufferSize;
     private boolean mDidSetup = false;
-    
-    private volatile boolean isPlaying = false;
-
     private long mFeedThreshold = 8000;
     private volatile boolean mDidInvokeFeedCallback = false;
     private volatile boolean mDidSendZero = false;
+    
+    // Keep track of playing state
+    private volatile boolean isPlaying = false;
 
+    // Thread-safe queue for storing audio samples
     private final LinkedBlockingQueue<ByteBuffer> mSamples = new LinkedBlockingQueue<>();
 
+    // Log level enum
     private enum LogLevel {
         NONE,
         ERROR,
@@ -74,7 +78,7 @@ public class FlutterPcmSoundPlugin implements
     }
 
     @Override
-    @SuppressWarnings("deprecation")
+    @SuppressWarnings("deprecation") // Needed for compatibility with Android < 23
     public void onMethodCall(@NonNull MethodCall call, @NonNull MethodChannel.Result result) {
         try {
             switch (call.method) {
@@ -86,14 +90,12 @@ public class FlutterPcmSoundPlugin implements
                     int sampleRate = call.argument("sample_rate");
                     mNumChannels = call.argument("num_channels");
 
+                    // Cleanup existing resources if any
                     if (mAudioTrack != null) {
                         cleanup();
                     }
 
-                    int channelConfig = (mNumChannels == 2) ?
-                        AudioFormat.CHANNEL_OUT_STEREO :
-                        AudioFormat.CHANNEL_OUT_MONO;
-
+                    int channelConfig = (mNumChannels == 2) ? AudioFormat.CHANNEL_OUT_STEREO : AudioFormat.CHANNEL_OUT_MONO;
                     mMinBufferSize = AudioTrack.getMinBufferSize(
                         sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT);
 
@@ -103,16 +105,17 @@ public class FlutterPcmSoundPlugin implements
                     }
 
                     if (Build.VERSION.SDK_INT >= 23) {
+                        // Android 6 (Marshmallow) and above
                         mAudioTrack = new AudioTrack.Builder()
                             .setAudioAttributes(new AudioAttributes.Builder()
-                                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                    .build())
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                .build())
                             .setAudioFormat(new AudioFormat.Builder()
-                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                    .setSampleRate(sampleRate)
-                                    .setChannelMask(channelConfig)
-                                    .build())
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setSampleRate(sampleRate)
+                                .setChannelMask(channelConfig)
+                                .build())
                             .setBufferSizeInBytes(mMinBufferSize)
                             .setTransferMode(AudioTrack.MODE_STREAM)
                             .build();
@@ -132,39 +135,44 @@ public class FlutterPcmSoundPlugin implements
                         mAudioTrack = null;
                         return;
                     }
-                    
+
+                    // Reset state
                     mSamples.clear();
                     mDidInvokeFeedCallback = false;
                     mDidSendZero = false;
                     mShouldCleanup = false;
+                    isPlaying = false; // Start in stopped state
 
+                    // Start playback thread
                     playbackThread = new Thread(this::playbackThreadLoop, "PCMPlaybackThread");
                     playbackThread.setPriority(Thread.MAX_PRIORITY);
                     playbackThread.start();
-                    
-                    isPlaying = true;
-                    mDidSetup = true;
 
+                    mDidSetup = true;
                     result.success(true);
                     break;
                 }
                 case "feed": {
+                    // Check setup (to match iOS behavior)
                     if (mDidSetup == false) {
                         result.error("Setup", "must call setup first", null);
                         return;
                     }
 
                     byte[] buffer = call.argument("buffer");
-                    
+
+                    // Reset flags
                     mDidInvokeFeedCallback = false;
                     mDidSendZero = false;
-                    
+
+                    // Split for better performance
                     List<ByteBuffer> chunks = split(buffer, MAX_FRAMES_PER_BUFFER);
 
+                    // Push to mSamples
                     for (ByteBuffer chunk : chunks) {
                         mSamples.put(chunk);
                     }
-                    
+
                     result.success(true);
                     break;
                 }
@@ -178,10 +186,10 @@ public class FlutterPcmSoundPlugin implements
                 }
                 case "stop": {
                     if (mAudioTrack != null && isPlaying) {
-                        mAudioTrack.pause();
-                        mAudioTrack.flush();
-                        mSamples.clear();
+                        // Don't pause/flush AudioTrack - keep it active to avoid re-initialization delays
+                        // Just stop writing data and clear the queue
                         isPlaying = false;
+                        mSamples.clear();
                     }
                     result.success(true);
                     break;
@@ -203,14 +211,18 @@ public class FlutterPcmSoundPlugin implements
         } catch (Exception e) {
             StringWriter sw = new StringWriter();
             PrintWriter pw = new PrintWriter(sw);
-e.printStackTrace(pw);
+            e.printStackTrace(pw);
             String stackTrace = sw.toString();
             result.error("androidException", e.toString(), stackTrace);
             return;
         }
     }
 
+    /**
+     * Cleans up resources by stopping the playback thread and releasing AudioTrack.
+     */
     private void cleanup() {
+        // Stop playback thread
         if (playbackThread != null) {
             mShouldCleanup = true;
             playbackThread.interrupt();
@@ -220,19 +232,34 @@ e.printStackTrace(pw);
                 Thread.currentThread().interrupt();
             }
             playbackThread = null;
+            mDidSetup = false;
         }
-        mDidSetup = false;
+
+        // Release AudioTrack
+        if (mAudioTrack != null) {
+            mAudioTrack.stop();
+            mAudioTrack.flush();
+            mAudioTrack.release();
+            mAudioTrack = null;
+        }
+        
         isPlaying = false;
     }
 
+    /**
+     * Calculates the number of remaining frames in the sample buffer.
+     */
     private long mRemainingFrames() {
         long totalBytes = 0;
         for (ByteBuffer sampleBuffer : mSamples) {
             totalBytes += sampleBuffer.remaining();
         }
-        return totalBytes / (2 * mNumChannels);
+        return totalBytes / (2 * mNumChannels); // 16-bit PCM
     }
 
+    /**
+     * Invokes the 'OnFeedSamples' callback with the number of remaining frames.
+     */
     private void invokeFeedCallback() {
         long remainingFrames = mRemainingFrames();
         Map<String, Object> response = new HashMap<>();
@@ -240,41 +267,42 @@ e.printStackTrace(pw);
         mMethodChannel.invokeMethod("OnFeedSamples", response);
     }
 
+    /**
+     * The main loop of the playback thread.
+     */
     private void playbackThreadLoop() {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
 
-        mAudioTrack.play();
+        // Start AudioTrack immediately but don't write data until start() is called
+        if (mAudioTrack != null) {
+            mAudioTrack.play();
+        }
 
         while (!mShouldCleanup) {
             ByteBuffer data = null;
             try {
-                // MODIFIED: Use poll() instead of take() to avoid blocking indefinitely.
-                // This allows the loop to continuously check the isPlaying flag.
-                data = mSamples.poll(10, TimeUnit.MILLISECONDS);
+                // Block indefinitely until new data - this eliminates polling delays
+                data = mSamples.take();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 continue;
             }
 
-            // MODIFIED: Only write data if we are in the 'playing' state.
-            if (data != null && isPlaying) {
+            // Only write data if we are in the 'playing' state
+            if (isPlaying) {
                 mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
             }
 
             long remaining = mRemainingFrames();
             boolean isThresholdEvent = remaining <= mFeedThreshold && !mDidInvokeFeedCallback;
-            boolean isZeroCrossingEvent = mDidSendZero == false && remaining == 0;
+            boolean isZeroCrossingEvent = mDidSendZero == false && remaining == 0 && isPlaying;
+            
             if (isThresholdEvent || isZeroCrossingEvent) {
                 mDidInvokeFeedCallback = true;
                 mDidSendZero = remaining == 0;
                 mainThreadHandler.post(this::invokeFeedCallback);
             }
         }
-
-        mAudioTrack.stop();
-        mAudioTrack.flush();
-        mAudioTrack.release();
-        mAudioTrack = null;
     }
 
     private List<ByteBuffer> split(byte[] buffer, int maxSize) {
