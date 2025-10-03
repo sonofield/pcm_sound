@@ -61,45 +61,8 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             NSDictionary *args = (NSDictionary*)call.arguments;
             NSNumber *sampleRate       = args[@"sample_rate"];
             NSNumber *numChannels      = args[@"num_channels"];
-#if TARGET_OS_IOS
-            NSString *iosAudioCategory = args[@"ios_audio_category"];
-#endif
 
             self.mNumChannels = [numChannels intValue];
-
-#if TARGET_OS_IOS
-	        // handle background audio in iOS
-            // Default to Playback if no matching case is found
-            AVAudioSessionCategory category = AVAudioSessionCategorySoloAmbient;
-            if ([iosAudioCategory isEqualToString:@"ambient"]) {
-                category = AVAudioSessionCategoryAmbient;
-            } else if ([iosAudioCategory isEqualToString:@"soloAmbient"]) {
-                category = AVAudioSessionCategorySoloAmbient;
-            } else if ([iosAudioCategory isEqualToString:@"playback"]) {
-                category = AVAudioSessionCategoryPlayback;
-            }
-            
-            // Set the AVAudioSession category based on the string value
-            NSError *error = nil;
-            [[AVAudioSession sharedInstance] setCategory:category error:&error];
-            if (error) {
-                NSLog(@"Error setting AVAudioSession category: %@", error);
-                result([FlutterError errorWithCode:@"AVAudioSessionError" 
-                                        message:@"Error setting AVAudioSession category" 
-                                        details:[error localizedDescription]]);
-                return;
-            }
-            
-            // Activate the audio session
-            [[AVAudioSession sharedInstance] setActive:YES error:&error];
-            if (error) {
-                NSLog(@"Error activating AVAudioSession: %@", error);
-                result([FlutterError errorWithCode:@"AVAudioSessionError" 
-                                        message:@"Error activating AVAudioSession" 
-                                        details:[error localizedDescription]]);
-                return;
-            }
-#endif
 
             // cleanup
             if (_mAudioUnit != nil) {
