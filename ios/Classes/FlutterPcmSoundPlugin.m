@@ -5,13 +5,22 @@
 #define kOutputBus 0
 #define NAMESPACE @"flutter_pcm_sound"
 
+typedef NS_ENUM(NSUInteger, LogLevel) {
+    none = 0,
+    error = 1,
+    standard = 2,
+    verbose = 3,
+};
+
 @interface FlutterPcmSoundPlugin ()
 @property(nonatomic) FlutterMethodChannel *mMethodChannel;
+@property(nonatomic) LogLevel mLogLevel;
 @property(nonatomic) AudioComponentInstance mAudioUnit;
 @property(nonatomic) NSMutableData *mSamples;
 @property(nonatomic) int mNumChannels;
 @property(nonatomic) int mFeedThreshold;
 @property(nonatomic) bool mDidInvokeFeedCallback;
+@property(nonatomic) bool mDidSetup;
 @property(nonatomic) BOOL _isPlaying;
 @property(nonatomic) BOOL mAllowBackgroundAudio;
 // A flag to know if the AudioUnit was stopped by a system interruption.
@@ -25,8 +34,10 @@
                                                                     binaryMessenger:[registrar messenger]];
     FlutterPcmSoundPlugin *instance = [[FlutterPcmSoundPlugin alloc] init];
     instance.mMethodChannel = methodChannel;
+    instance.mLogLevel = standard;
     instance.mSamples = [NSMutableData new];
     instance.mFeedThreshold = 8000;
+    instance.mDidSetup = false;
     
     // Listen for system audio interruptions (e.g., phone calls).
     [[NSNotificationCenter defaultCenter] addObserver:instance
@@ -38,15 +49,20 @@
 }
 
 - (void)handleMethodCall:(FlutterMethodCall *)call result:(FlutterResult)result {
-    if ([@"setup" isEqualToString:call.method]) {
+    if ([@"setLogLevel" isEqualToString:call.method]) {
+        NSDictionary *args = (NSDictionary*)call.arguments;
+        NSNumber *logLevelNumber = args[@"log_level"];
+        self.mLogLevel = (LogLevel)[logLevelNumber integerValue];
+        result(@YES);
+        
+    } else if ([@"setup" isEqualToString:call.method]) {
         if (_mAudioUnit != nil) { [self cleanup]; }
         
         NSDictionary *args = (NSDictionary*)call.arguments;
         self.mNumChannels = [args[@"num_channels"] intValue];
         self.mAllowBackgroundAudio = [args[@"ios_allow_background_audio"] boolValue];
         
-        // 1. Configure and activate the audio session. The plugin now owns its session.
-        [self setupAudioSession];
+        // Audio session is managed externally by the app
         
         // 2. Set up the AudioUnit (same as before).
         AudioComponentDescription desc = {0};
@@ -82,11 +98,39 @@
         result(@YES);
         
     } else if ([@"feed" isEqualToString:call.method]) {
+        // Setup check
+        if (self.mDidSetup == false) {
+            result([FlutterError errorWithCode:@"Setup" message:@"must call setup first" details:nil]);
+            return;
+        }
+        
         FlutterStandardTypedData *buffer = call.arguments[@"buffer"];
         @synchronized (self.mSamples) {
             [self.mSamples appendData:buffer.data];
         }
         self.mDidInvokeFeedCallback = false;
+        
+        // Try to start AudioUnit if not already playing, handle error 561015905
+        if (!self._isPlaying) {
+            OSStatus status = AudioOutputUnitStart(self.mAudioUnit);
+            if (status != noErr) {
+                // Error 561015905 occurs when trying to start AudioUnit in background state
+                if (status == 561015905) {
+                    // This is a transient error when app is not fully active
+                    // Don't surface this error, just log it and continue
+                    NSLog(@"AudioOutputUnitStart failed with transient error 561015905 in feed() (app not fully active)");
+                    result(@YES);
+                    return;
+                } else {
+                    // For other errors, surface them
+                    NSString* message = [NSString stringWithFormat:@"AudioOutputUnitStart failed in feed(). OSStatus: %d", (int)status];
+                    result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
+                    return;
+                }
+            }
+            self._isPlaying = YES;
+        }
+        
         result(@YES);
         
     } else if ([@"start" isEqualToString:call.method]) {
@@ -97,6 +141,24 @@
                 self.mIsInterrupted = NO;
             }
             self._isPlaying = YES;
+            
+            // Try to start AudioUnit, handle error 561015905 specifically
+            OSStatus status = AudioOutputUnitStart(self.mAudioUnit);
+            if (status != noErr) {
+                // Error 561015905 occurs when trying to start AudioUnit in background state
+                if (status == 561015905) {
+                    // This is a transient error when app is not fully active
+                    // Don't surface this error, just log it and continue
+                    NSLog(@"AudioOutputUnitStart failed with transient error 561015905 (app not fully active)");
+                    result(@YES);
+                    return;
+                } else {
+                    // For other errors, surface them
+                    NSString* message = [NSString stringWithFormat:@"AudioOutputUnitStart failed. OSStatus: %d", (int)status];
+                    result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
+                    return;
+                }
+            }
         }
         result(@YES);
         
@@ -109,6 +171,12 @@
         }
         result(@YES);
         
+    } else if ([@"setFeedThreshold" isEqualToString:call.method]) {
+        NSDictionary *args = (NSDictionary*)call.arguments;
+        NSNumber *feedThreshold = args[@"feed_threshold"];
+        self.mFeedThreshold = [feedThreshold intValue];
+        result(@YES);
+        
     } else if ([@"release" isEqualToString:call.method]) {
         [self cleanup];
         result(@YES);
@@ -118,13 +186,7 @@
     }
 }
 
-// A dedicated method to handle the audio session setup.
-- (void)setupAudioSession {
-    AVAudioSession *session = [AVAudioSession sharedInstance];
-    AVAudioSessionCategory category = self.mAllowBackgroundAudio ? AVAudioSessionCategoryPlayback : AVAudioSessionCategorySoloAmbient;
-    [session setCategory:category error:nil];
-    [session setActive:YES error:nil];
-}
+// Audio session setup removed - handled externally by the app
 
 // The core of the stability fix: handle system interruptions gracefully.
 - (void)handleInterruption:(NSNotification *)notification {
@@ -141,8 +203,8 @@
         // The interruption has ended.
         AVAudioSessionInterruptionOptions options = [userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
         if (options == AVAudioSessionInterruptionOptionShouldResume) {
-            // The system suggests we can resume. Reactivate our session and AudioUnit.
-            [self setupAudioSession];
+            // The system suggests we can resume. Restart AudioUnit.
+            // Audio session reactivation is handled externally by the app.
             if (self.mAudioUnit) {
                 AudioUnitInitialize(self.mAudioUnit);
                 AudioOutputUnitStart(self.mAudioUnit);
@@ -159,7 +221,7 @@
         AudioComponentInstanceDispose(_mAudioUnit);
         _mAudioUnit = nil;
         self._isPlaying = NO;
-        [[AVAudioSession sharedInstance] setActive:NO error:nil];
+        // Audio session deactivation handled externally by the app
     }
     @synchronized (self.mSamples) {
         [self.mSamples setLength:0];
