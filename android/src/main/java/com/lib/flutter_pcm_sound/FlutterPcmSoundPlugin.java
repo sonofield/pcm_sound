@@ -278,37 +278,37 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
         }
 
         while (!mShouldCleanup) {
-            // Only process data when playing
-            if (isPlaying) {
-                ByteBuffer data = null;
-                try {
-                    // Block indefinitely until new data - this eliminates polling delays
-                    data = mSamples.take();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    continue;
+            ByteBuffer data = null;
+            try {
+                // Use poll() with timeout instead of blocking take()
+                // This prevents the thread from getting stuck and allows it to continuously
+                // check the 'isPlaying' flag.
+                if (isPlaying) {
+                    // Only try to get data if we are in the playing state
+                    data = mSamples.poll(20, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } else {
+                    // If not playing, sleep briefly to prevent busy-loop and allow 'start()' to be called
+                    Thread.sleep(20);
                 }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                continue;
+            }
 
-                // Write data to AudioTrack
+            // Only write data if we have data and are playing
+            if (data != null) {
                 mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
+            }
 
-                long remaining = mRemainingFrames();
-                boolean isThresholdEvent = remaining <= mFeedThreshold && !mDidInvokeFeedCallback;
-                boolean isZeroCrossingEvent = mDidSendZero == false && remaining == 0;
-                
-                if (isThresholdEvent || isZeroCrossingEvent) {
-                    mDidInvokeFeedCallback = true;
-                    mDidSendZero = remaining == 0;
-                    mainThreadHandler.post(this::invokeFeedCallback);
-                }
-            } else {
-                // When not playing, just sleep briefly to avoid busy waiting
-                try {
-                    Thread.sleep(10);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
+            long remaining = mRemainingFrames();
+            boolean isThresholdEvent = remaining <= mFeedThreshold && !mDidInvokeFeedCallback;
+            // Only trigger callbacks if we are actually playing
+            boolean isZeroCrossingEvent = mDidSendZero == false && remaining == 0 && isPlaying;
+            
+            if (isThresholdEvent || isZeroCrossingEvent) {
+                mDidInvokeFeedCallback = true;
+                mDidSendZero = remaining == 0;
+                mainThreadHandler.post(this::invokeFeedCallback);
             }
         }
     }
