@@ -28,8 +28,8 @@ import io.flutter.plugin.common.MethodChannel;
  * FlutterPcmSoundPlugin implements a reliable PCM sound playback mechanism
  * with start/stop control for musical applications.
  * 
- * This version keeps the AudioTrack always active to avoid re-initialization delays,
- * but uses blocking queue operations to eliminate polling delays.
+ * Uses software gating approach: AudioTrack stays active and plays silence when stopped,
+ * avoiding expensive hardware state changes that cause multi-second delays.
  */
 public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.MethodCallHandler {
     private static final String CHANNEL_NAME = "flutter_pcm_sound/methods";
@@ -141,7 +141,7 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                     mDidInvokeFeedCallback = false;
                     mDidSendZero = false;
                     mShouldCleanup = false;
-                    isPlaying = false; // Start in stopped state
+                    isPlaying = false; // Start in stopped state (software gated)
 
                     // Start playback thread
                     playbackThread = new Thread(this::playbackThreadLoop, "PCMPlaybackThread");
@@ -186,8 +186,7 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                 }
                 case "stop": {
                     if (mAudioTrack != null && isPlaying) {
-                        // Don't pause/flush AudioTrack - keep it active to avoid re-initialization delays
-                        // Just stop writing data and clear the queue
+                        // Software gating: just stop writing data, keep AudioTrack active
                         isPlaying = false;
                         mSamples.clear();
                     }
@@ -273,7 +272,7 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
     private void playbackThreadLoop() {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
 
-        // Start AudioTrack immediately but don't write data until start() is called
+        // Start AudioTrack immediately and keep it active
         if (mAudioTrack != null) {
             mAudioTrack.play();
         }
@@ -288,10 +287,11 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                 continue;
             }
 
-            // Only write data if we are in the 'playing' state
+            // Software gating: only write data when isPlaying is true
             if (isPlaying) {
                 mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
             }
+            // When isPlaying is false, AudioTrack just plays silence (computationally cheap)
 
             long remaining = mRemainingFrames();
             boolean isThresholdEvent = remaining <= mFeedThreshold && !mDidInvokeFeedCallback;
