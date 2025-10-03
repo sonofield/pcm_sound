@@ -29,8 +29,7 @@ public class FlutterPcmSoundPlugin implements
     FlutterPlugin,
     MethodChannel.MethodCallHandler
 {
-    private final int MAX_FRAMES_PER_BUFFER = 100;
-    private final int FRAMES_PER_NOTIFICATION = 500;
+    private final int FRAMES_PER_CHUNK = 200;
 
     private static final String TAG = "[PCM-Android]";
     private static final String CHANNEL_NAME = "flutter_pcm_sound/methods";
@@ -140,7 +139,9 @@ public class FlutterPcmSoundPlugin implements
             case "play":
                 if (mIsPlaying == false) {
                     mDidInvokeFeedCallback = false;
-                    invokeFeedCallback();
+                    if (mSamplesRemainingFrames() == 0) {
+                        invokeFeedCallback();
+                    }
                     mAudioTrack.play();
                     resumePlaybackThread();
                 }
@@ -171,8 +172,9 @@ public class FlutterPcmSoundPlugin implements
             case "feed":
                 byte[] buffer = call.argument("buffer");
 
-                // Split into smaller buffers
-                List<ByteBuffer> got = split(buffer, MAX_FRAMES_PER_BUFFER);
+                // Split into 200-frame chunks (frames, not bytes)
+                int bytesPerFrame = 2 * mNumChannels;
+                List<ByteBuffer> got = splitByFrames(buffer, FRAMES_PER_CHUNK, bytesPerFrame);
                 for (ByteBuffer chunk : got) {
                     mSamplesPush(chunk);
                 }
@@ -284,6 +286,11 @@ public class FlutterPcmSoundPlugin implements
                                     mainThreadHandler.post(() -> invokeFeedCallback());
                                 }
                             }
+                            // If drained to zero, ensure callback
+                            if (mSamplesRemainingFrames() == 0 && mDidInvokeFeedCallback == false) {
+                                mDidInvokeFeedCallback = true;
+                                mainThreadHandler.post(() -> invokeFeedCallback());
+                            }
                         }
                         // avoid excessive CPU usage
                         Thread.sleep(5);
@@ -339,12 +346,13 @@ public class FlutterPcmSoundPlugin implements
         }
     }
 
-    // split large array into smaller ones, for better perf
-    private List<ByteBuffer> split(byte[] buffer, int maxSize) {
+    // split into fixed frame-sized chunks for better perf and consistent feed cadence
+    private List<ByteBuffer> splitByFrames(byte[] buffer, int framesPerChunk, int bytesPerFrame) {
         List<ByteBuffer> chunks = new ArrayList<>();
+        int chunkBytes = framesPerChunk * bytesPerFrame;
         int offset = 0;
         while (offset < buffer.length) {
-            int length = Math.min(buffer.length - offset, maxSize);
+            int length = Math.min(buffer.length - offset, chunkBytes);
             ByteBuffer b = ByteBuffer.allocate(length);
             b.put(buffer, offset, length);
             b.rewind();

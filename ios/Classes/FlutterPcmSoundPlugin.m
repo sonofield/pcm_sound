@@ -24,6 +24,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 @property(nonatomic) int mNumChannels; 
 @property(nonatomic) int mFeedThreshold; 
 @property(nonatomic) bool mDidInvokeFeedCallback; 
+@property(nonatomic) bool mDidInvokeZeroCallback; 
 @end
 
 @implementation FlutterPcmSoundPlugin
@@ -39,6 +40,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     instance.mSamples = [NSMutableData new];
     instance.mFeedThreshold = 8000;
     instance.mDidInvokeFeedCallback = false;
+    instance.mDidInvokeZeroCallback = false;
 
     [registrar addMethodCallDelegate:instance channel:methodChannel];
 }
@@ -141,7 +143,12 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         }
         else if ([@"play" isEqualToString:call.method])
         {
+            if (_mAudioUnit == nil) {
+                result([FlutterError errorWithCode:@"mAudioUnitNull" message:@"you must call setup()" details:nil]);
+                return;
+            }
             self.mDidInvokeFeedCallback = false;
+            self.mDidInvokeZeroCallback = false;
 
             OSStatus status = AudioOutputUnitStart(_mAudioUnit);
             if (status != noErr) {
@@ -154,6 +161,10 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         }
         else if ([@"pause" isEqualToString:call.method])
         {
+            if (_mAudioUnit == nil) {
+                result([FlutterError errorWithCode:@"mAudioUnitNull" message:@"you must call setup()" details:nil]);
+                return;
+            }
             OSStatus status = AudioOutputUnitStop(_mAudioUnit);
             if (status != noErr) {
                 NSString* message = [NSString stringWithFormat:@"AudioOutputUnitStop failed. OSStatus: %@", @(status)];
@@ -165,6 +176,10 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         }
         else if ([@"stop" isEqualToString:call.method])
         {
+            if (_mAudioUnit == nil) {
+                result([FlutterError errorWithCode:@"mAudioUnitNull" message:@"you must call setup()" details:nil]);
+                return;
+            }
             OSStatus status = AudioOutputUnitStop(_mAudioUnit);
             if (status != noErr) {
                 NSString* message = [NSString stringWithFormat:@"AudioOutputUnitStop failed. OSStatus: %@", @(status)];
@@ -179,6 +194,10 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         }
         else if ([@"clear" isEqualToString:call.method])
         {
+            if (_mAudioUnit == nil) {
+                result([FlutterError errorWithCode:@"mAudioUnitNull" message:@"you must call setup()" details:nil]);
+                return;
+            }
             @synchronized (self.mSamples) {
                 [self.mSamples setLength:0];
             }
@@ -186,6 +205,10 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         }
         else if ([@"feed" isEqualToString:call.method])
         {
+            if (_mAudioUnit == nil) {
+                result([FlutterError errorWithCode:@"mAudioUnitNull" message:@"you must call setup()" details:nil]);
+                return;
+            }
             NSDictionary *args = (NSDictionary*)call.arguments;
             FlutterStandardTypedData *buffer = args[@"buffer"];
 
@@ -195,6 +218,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 
             // reset
             self.mDidInvokeFeedCallback = false;
+            self.mDidInvokeZeroCallback = false;
 
             result(@(true));
         }
@@ -256,12 +280,15 @@ static OSStatus RenderCallback(void *inRefCon,
 
     NSUInteger remainingFrames;
     BOOL shouldRequestMore = false;
+    BOOL shouldRequestZero = false;
 
     @synchronized (instance.mSamples) {
+        // zero-fill buffer to avoid noise
+        memset(ioData->mBuffers[0].mData, 0, ioData->mBuffers[0].mDataByteSize);
 
         NSUInteger bytesToCopy = MIN(ioData->mBuffers[0].mDataByteSize, [instance.mSamples length]);
         
-        // provide samples
+        // provide samples (partial allowed)
         memcpy(ioData->mBuffers[0].mData, [instance.mSamples bytes], bytesToCopy);
 
         // pop front bytes
@@ -276,9 +303,16 @@ static OSStatus RenderCallback(void *inRefCon,
                 shouldRequestMore = true;
             }
         }
+
+        if (remainingFrames == 0) {
+            if (instance.mDidInvokeZeroCallback == false) {
+                instance.mDidInvokeZeroCallback = true;
+                shouldRequestZero = true;
+            }
+        }
     }
 
-    if (shouldRequestMore) { 
+    if (shouldRequestMore || shouldRequestZero) { 
         NSDictionary *response = @{@"remaining_frames": @(remainingFrames)};
         dispatch_async(dispatch_get_main_queue(), ^{
             [instance.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:response];
