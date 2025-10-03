@@ -30,6 +30,8 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 @property(nonatomic) BOOL mAllowBackgroundAudio;
 // The software gate flag, equivalent to the Android version.
 @property(nonatomic) BOOL _isPlaying;
+// OPTIONAL: Additional safety lock for cleanup operations
+@property(nonatomic, strong) NSLock *cleanupLock;
 
 @end
 
@@ -50,6 +52,8 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     instance.mDidSetup = false;
     instance.mIsAppActive = true;
     instance.mAllowBackgroundAudio = false;
+    // Initialize cleanup lock for additional safety
+    instance.cleanupLock = [[NSLock alloc] init];
 
 #if TARGET_OS_IOS
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -146,6 +150,37 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 return;
             }
 
+#if TARGET_OS_IOS
+            // CRASH FIX: Configure audio session for foreground services
+            NSError *audioSessionError = nil;
+            AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+            
+            if (self.mAllowBackgroundAudio) {
+                [audioSession setCategory:AVAudioSessionCategoryPlayback 
+                             withOptions:AVAudioSessionCategoryOptionAllowBluetooth 
+                                   error:&audioSessionError];
+            } else {
+                [audioSession setCategory:AVAudioSessionCategoryPlayback 
+                             withOptions:AVAudioSessionCategoryOptionDefaultToSpeaker 
+                                   error:&audioSessionError];
+            }
+            
+            if (audioSessionError) {
+                result([FlutterError errorWithCode:@"AudioSessionError" 
+                                          message:[NSString stringWithFormat:@"Failed to set audio session category: %@", audioSessionError.localizedDescription] 
+                                          details:nil]);
+                return;
+            }
+            
+            [audioSession setActive:YES error:&audioSessionError];
+            if (audioSessionError) {
+                result([FlutterError errorWithCode:@"AudioSessionError" 
+                                          message:[NSString stringWithFormat:@"Failed to activate audio session: %@", audioSessionError.localizedDescription] 
+                                          details:nil]);
+                return;
+            }
+#endif
+
             // --- IMPROVEMENT ---
             // Start the AudioUnit once and let it run. It will pull data from the RenderCallback.
             // This avoids the overhead of starting/stopping the hardware.
@@ -200,10 +235,16 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             // We just set the flag and clear the buffer to stop sound immediately.
             // This prevents the hardware-induced delay on restart.
             if (self.mAudioUnit != nil && self._isPlaying) {
+                // CRASH FIX: Set playing flag first, then clear buffer to prevent race condition
                 self._isPlaying = NO;
                 @synchronized (self.mSamples) {
-                    [self.mSamples setLength:0];
+                    if (self.mSamples) {
+                        [self.mSamples setLength:0];
+                    }
                 }
+                // Reset callback flags to prevent stale callbacks
+                self.mDidInvokeFeedCallback = false;
+                self.mDidSendZero = false;
             }
             result(@YES);
         }
@@ -233,17 +274,45 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 
 - (void)cleanup
 {
-    if (_mAudioUnit != nil) {
-        // This is the correct place to fully stop and dispose of the AudioUnit.
-        AudioOutputUnitStop(_mAudioUnit);
-        AudioUnitUninitialize(_mAudioUnit);
-        AudioComponentInstanceDispose(_mAudioUnit);
-        _mAudioUnit = nil;
-        self.mDidSetup = false;
+    // HYBRID APPROACH: Use lock for critical cleanup section only
+    [self.cleanupLock lock];
+    @try {
+        // CRASH FIX: Set flags first to prevent RenderCallback from accessing invalid state
         self._isPlaying = NO;
-    }
-    @synchronized (self.mSamples) {
-        self.mSamples = [NSMutableData new];
+        self.mDidSetup = false;
+        self.mDidInvokeFeedCallback = false;
+        self.mDidSendZero = false;
+        
+        // Clear samples buffer safely
+        @synchronized (self.mSamples) {
+            if (self.mSamples) {
+                [self.mSamples setLength:0];
+            }
+        }
+        
+        // Clean up AudioUnit if it exists
+        if (_mAudioUnit != nil) {
+            // This is the correct place to fully stop and dispose of the AudioUnit.
+            AudioOutputUnitStop(_mAudioUnit);
+            AudioUnitUninitialize(_mAudioUnit);
+            AudioComponentInstanceDispose(_mAudioUnit);
+            _mAudioUnit = nil;
+        }
+        
+#if TARGET_OS_IOS
+        // CRASH FIX: Deactivate audio session to prevent conflicts in foreground services
+        NSError *audioSessionError = nil;
+        AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+        [audioSession setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:&audioSessionError];
+        if (audioSessionError && self.mLogLevel >= error) {
+            NSLog(@"Warning: Failed to deactivate audio session during cleanup: %@", audioSessionError.localizedDescription);
+        }
+#endif
+        
+        // CRASH FIX: Clear method channel reference to prevent stale callbacks
+        self.mMethodChannel = nil;
+    } @finally {
+        [self.cleanupLock unlock];
     }
 }
 
@@ -257,8 +326,33 @@ static OSStatus RenderCallback(void *inRefCon,
                                AudioBufferList *ioData)
 {
     FlutterPcmSoundPlugin *instance = (__bridge FlutterPcmSoundPlugin *)(inRefCon);
+    
+    // CRASH FIX: Add null checks to prevent crashes in foreground services
+    if (!instance || !ioData || !ioData->mBuffers || ioData->mNumberBuffers == 0) {
+        return noErr;
+    }
+
+    // HYBRID APPROACH: Quick cleanup check without blocking audio thread
+    if ([instance.cleanupLock tryLock]) {
+        [instance.cleanupLock unlock];
+    } else {
+        // Cleanup in progress, provide silence
+        if (ioData->mBuffers[0].mData) {
+            memset(ioData->mBuffers[0].mData, 0, ioData->mBuffers[0].mDataByteSize);
+        }
+        return noErr;
+    }
 
     @synchronized (instance.mSamples) {
+        // CRASH FIX: Check if instance is still valid before proceeding
+        if (!instance.mSamples || !instance.mAudioUnit) {
+            // Fill with silence if instance is being destroyed
+            if (ioData->mBuffers[0].mData) {
+                memset(ioData->mBuffers[0].mData, 0, ioData->mBuffers[0].mDataByteSize);
+            }
+            return noErr;
+        }
+        
         // First, check the software gate flag.
         if (instance._isPlaying && [instance.mSamples length] > 0) {
             // If playing, copy as much data as we have, up to the buffer size.
@@ -283,12 +377,19 @@ static OSStatus RenderCallback(void *inRefCon,
         BOOL isThresholdEvent = remainingFrames <= instance.mFeedThreshold && !instance.mDidInvokeFeedCallback;
         BOOL isZeroCrossingEvent = instance.mDidSendZero == false && remainingFrames == 0;
 
-        if (isThresholdEvent || isZeroCrossingEvent) {
+        // CRASH FIX: Only invoke callback if method channel is still valid
+        if ((isThresholdEvent || isZeroCrossingEvent) && instance.mMethodChannel) {
             instance.mDidInvokeFeedCallback = true;
             instance.mDidSendZero = remainingFrames == 0;
             NSDictionary *response = @{@"remaining_frames": @(remainingFrames)};
+            
+            // CRASH FIX: Use weak reference to prevent retain cycle and check validity
+            __weak typeof(instance) weakInstance = instance;
             dispatch_async(dispatch_get_main_queue(), ^{
-                [instance.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:response];
+                __strong typeof(weakInstance) strongInstance = weakInstance;
+                if (strongInstance && strongInstance.mMethodChannel && strongInstance.mAudioUnit) {
+                    [strongInstance.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:response];
+                }
             });
         }
     }
