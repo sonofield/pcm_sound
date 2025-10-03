@@ -278,29 +278,37 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
         }
 
         while (!mShouldCleanup) {
-            ByteBuffer data = null;
-            try {
-                // Block indefinitely until new data - this eliminates polling delays
-                data = mSamples.take();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                continue;
-            }
-
-            // Software gating: only write data when isPlaying is true
+            // Only process data when playing
             if (isPlaying) {
-                mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
-            }
-            // When isPlaying is false, AudioTrack just plays silence (computationally cheap)
+                ByteBuffer data = null;
+                try {
+                    // Block indefinitely until new data - this eliminates polling delays
+                    data = mSamples.take();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    continue;
+                }
 
-            long remaining = mRemainingFrames();
-            boolean isThresholdEvent = remaining <= mFeedThreshold && !mDidInvokeFeedCallback;
-            boolean isZeroCrossingEvent = mDidSendZero == false && remaining == 0 && isPlaying;
-            
-            if (isThresholdEvent || isZeroCrossingEvent) {
-                mDidInvokeFeedCallback = true;
-                mDidSendZero = remaining == 0;
-                mainThreadHandler.post(this::invokeFeedCallback);
+                // Write data to AudioTrack
+                mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
+
+                long remaining = mRemainingFrames();
+                boolean isThresholdEvent = remaining <= mFeedThreshold && !mDidInvokeFeedCallback;
+                boolean isZeroCrossingEvent = mDidSendZero == false && remaining == 0;
+                
+                if (isThresholdEvent || isZeroCrossingEvent) {
+                    mDidInvokeFeedCallback = true;
+                    mDidSendZero = remaining == 0;
+                    mainThreadHandler.post(this::invokeFeedCallback);
+                }
+            } else {
+                // When not playing, just sleep briefly to avoid busy waiting
+                try {
+                    Thread.sleep(10);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
     }

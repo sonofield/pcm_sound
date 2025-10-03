@@ -1,0 +1,131 @@
+---
+alwaysApply: true
+---
+
+# Flutter PCM Sound Plugin - Development Notes
+
+## Project Overview
+This is a Flutter plugin for PCM audio playback with start/stop control, designed for musical applications like ear training apps. The plugin supports both Android and iOS platforms.
+
+## Current Status
+- **iOS Implementation**: ✅ Working (tested and stable)
+- **Android Implementation**: ⚠️ **UNTESTED** - Recently refactored with software gating approach
+- **Dart API**: ✅ Stable and working
+
+## Key Architecture Decisions
+
+### Android Implementation: Software Gating Approach
+**Critical Principle**: For responsive start/stop audio control in Android, manage playback state in software instead of manipulating hardware state.
+
+#### What Works (The "Do's" ✅)
+- **Software Gating**: Use a boolean flag (`isPlaying`) to control audio data flow
+- **Keep AudioTrack Active**: Initialize `AudioTrack` once and keep it in "playing" state
+- **To "Stop"**: Set `isPlaying = false` and clear audio sample queue. AudioTrack plays silence (computationally cheap)
+- **To "Start"**: Set `isPlaying = true`. Playback thread immediately feeds AudioTrack with queued samples
+- **Blocking Queue Operations**: Use `mSamples.take()` instead of polling to eliminate delays
+
+#### What to Avoid (The "Don'ts" ❌)
+- **Avoid `pause()` and `flush()`**: Do NOT call `AudioTrack.pause()` or `AudioTrack.flush()` for frequent start/stop
+- **Hardware State Changes**: These cause Android audio system to de-allocate/re-initialize buffers, introducing multi-second delays
+
+### iOS Implementation: Hardware Control
+iOS uses `AudioOutputUnitStart/Stop` because Core Audio handles hardware state changes more efficiently than Android's AudioTrack.
+
+## File Structure
+```
+android/src/main/java/com/lib/flutter_pcm_sound/FlutterPcmSoundPlugin.java  # ⚠️ UNTESTED
+ios/Classes/FlutterPcmSoundPlugin.m                                        # ✅ WORKING
+lib/flutter_pcm_sound.dart                                                 # ✅ STABLE
+```
+
+## API Methods
+- `setup(sampleRate, channelCount, iosAllowBackgroundAudio)` - Initialize audio system
+- `feed(buffer)` - Queue PCM audio data
+- `start()` - Begin playback
+- `stop()` - Pause playback
+- `setFeedThreshold(threshold)` - Set callback threshold
+- `release()` - Clean up resources
+- `setFeedCallback(callback)` - Set callback for when more data needed
+
+## Critical Implementation Details
+
+### Android Playback Thread Logic (Current Implementation)
+```java
+while (!mShouldCleanup) {
+    if (isPlaying) {
+        // Only consume data when playing
+        data = mSamples.take();
+        mAudioTrack.write(data, ...);
+        // Check feed callbacks
+    } else {
+        // When stopped, sleep (AudioTrack plays silence)
+        Thread.sleep(10);
+    }
+}
+```
+
+### Key Variables
+- `isPlaying`: Software gate controlling audio flow
+- `mSamples`: Thread-safe queue for audio data
+- `mFeedThreshold`: Frames remaining before requesting more data
+- `mDidInvokeFeedCallback`: Prevents duplicate callbacks
+- `mDidSendZero`: Tracks zero-crossing events
+
+## Known Issues & Solutions
+
+### Issue: Multi-second delays when resuming playback
+**Cause**: Using `AudioTrack.pause()/flush()` causes hardware re-initialization
+**Solution**: Use software gating with `isPlaying` flag (implemented in current version)
+
+### Issue: No sound after stop/start cycle
+**Cause**: Data being consumed from queue when not playing
+**Solution**: Only call `mSamples.take()` when `isPlaying = true` (implemented in current version)
+
+### Issue: Audio glitches in foreground service
+**Cause**: Complex state management or polling delays
+**Solution**: Use blocking queue operations and simple state flags (implemented in current version)
+
+## Version History
+- **Version A** (Original): Simple start/stop API, worked perfectly
+- **Version B** (Maintainer): Removed start/stop, made "one pedal" auto-start/stop
+- **Version C** (Problematic): Added back start/stop but with problematic polling (`poll(10ms)`)
+- **Current Version** (Untested): Software gating approach, combines reliability of A with modern Android compatibility
+
+## Testing Scenarios (To Be Validated)
+1. **Melodies Mode**: Screen on, audio out only
+2. **Voice Mode**: Screen on, audio out + mic input
+3. **Pocket Mode**: Screen off, foreground service, audio out only
+
+## Platform Differences
+| Feature | Android | iOS |
+|---------|---------|-----|
+| Audio System | AudioTrack | AudioUnit |
+| Start/Stop | Software gating | Hardware control |
+| Background Audio | Manual handling | Built-in support |
+| State Management | `isPlaying` flag | `_isPlaying` property |
+| Status | ⚠️ Untested | ✅ Working |
+
+## Development Notes
+- **CRITICAL**: Android implementation needs testing before production use
+- Always test start/stop responsiveness (should be instant)
+- Verify no audio glitches in foreground service mode
+- Ensure feed callbacks work correctly for continuous playback
+- Test with different sample rates and channel configurations
+- Monitor for memory leaks in long-running audio sessions
+
+## Debugging Tips
+- Use `LogLevel.VERBOSE` for detailed logging
+- Check `mRemainingFrames()` to verify queue state
+- Monitor `isPlaying` flag state changes
+- Verify AudioTrack state with `getState()`
+- Test with simple sine wave generation first
+
+## Next Steps
+1. **Test Android implementation** with all three game modes
+2. **Validate start/stop responsiveness** (should be instant)
+3. **Check foreground service compatibility** (Pocket mode)
+4. **Monitor for any audio glitches** or delays
+5. **Update status** once testing is complete
+
+## Fallback Plan
+If current Android implementation has issues, consider reverting to Version A approach or implementing a hybrid solution based on testing results.
