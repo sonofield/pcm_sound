@@ -28,6 +28,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 @property(nonatomic) bool mDidSetup;
 @property(nonatomic) BOOL mIsAppActive;
 @property(nonatomic) BOOL mAllowBackgroundAudio;
+// The software gate flag, equivalent to the Android version.
 @property(nonatomic) BOOL _isPlaying;
 
 @end
@@ -77,9 +78,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         {
             NSDictionary *args = (NSDictionary*)call.arguments;
             NSNumber *logLevelNumber  = args[@"log_level"];
-
             self.mLogLevel = (LogLevel)[logLevelNumber integerValue];
-
             result(@YES);
         }
         else if ([@"setup" isEqualToString:call.method])
@@ -88,18 +87,15 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             NSNumber *sampleRate       = args[@"sample_rate"];
             NSNumber *numChannels      = args[@"num_channels"];
 #if TARGET_OS_IOS
-            // We still read this value, but session management is now external.
             self.mAllowBackgroundAudio = [args[@"ios_allow_background_audio"] boolValue];
 #endif
 
             self.mNumChannels = [numChannels intValue];
 
-            // cleanup
             if (_mAudioUnit != nil) {
                 [self cleanup];
             }
 
-            // create
             AudioComponentDescription desc;
             desc.componentType = kAudioUnitType_Output;
 #if TARGET_OS_IOS
@@ -114,12 +110,10 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             AudioComponent inputComponent = AudioComponentFindNext(NULL, &desc);
             OSStatus status = AudioComponentInstanceNew(inputComponent, &_mAudioUnit);
             if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioComponentInstanceNew failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
+                result([FlutterError errorWithCode:@"AudioUnitError" message:@"AudioComponentInstanceNew failed" details:nil]);
                 return;
             }
 
-            // set stream format
             AudioStreamBasicDescription audioFormat;
             audioFormat.mSampleRate = [sampleRate intValue];
             audioFormat.mFormatID = kAudioFormatLinearPCM;
@@ -130,60 +124,46 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             audioFormat.mBytesPerFrame = self.mNumChannels * (audioFormat.mBitsPerChannel / 8);
             audioFormat.mBytesPerPacket = audioFormat.mBytesPerFrame * audioFormat.mFramesPerPacket;
 
-            status = AudioUnitSetProperty(_mAudioUnit,
-                                    kAudioUnitProperty_StreamFormat,
-                                    kAudioUnitScope_Input,
-                                    kOutputBus,
-                                    &audioFormat,
-                                    sizeof(audioFormat));
+            status = AudioUnitSetProperty(_mAudioUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, kOutputBus, &audioFormat, sizeof(audioFormat));
             if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioUnitSetProperty StreamFormat failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
+                result([FlutterError errorWithCode:@"AudioUnitError" message:@"AudioUnitSetProperty StreamFormat failed" details:nil]);
                 return;
             }
 
-            // set callback
             AURenderCallbackStruct callback;
             callback.inputProc = RenderCallback;
             callback.inputProcRefCon = (__bridge void *)(self);
 
-            status = AudioUnitSetProperty(_mAudioUnit,
-                                kAudioUnitProperty_SetRenderCallback,
-                                kAudioUnitScope_Global,
-                                kOutputBus,
-                                &callback,
-                                sizeof(callback));
+            status = AudioUnitSetProperty(_mAudioUnit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Global, kOutputBus, &callback, sizeof(callback));
             if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioUnitSetProperty SetRenderCallback failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
+                result([FlutterError errorWithCode:@"AudioUnitError" message:@"AudioUnitSetProperty SetRenderCallback failed" details:nil]);
                 return;
             }
 
-            // initialize
             status = AudioUnitInitialize(_mAudioUnit);
             if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioUnitInitialize failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
+                result([FlutterError errorWithCode:@"AudioUnitError" message:@"AudioUnitInitialize failed" details:nil]);
+                return;
+            }
+
+            // --- IMPROVEMENT ---
+            // Start the AudioUnit once and let it run. It will pull data from the RenderCallback.
+            // This avoids the overhead of starting/stopping the hardware.
+            status = AudioOutputUnitStart(_mAudioUnit);
+            if (status != noErr) {
+                result([FlutterError errorWithCode:@"AudioUnitError" message:@"AudioOutputUnitStart failed" details:nil]);
                 return;
             }
 
             self.mDidSetup = true;
-            self._isPlaying = NO; // MODIFIED: Initialize playing state.
+            self._isPlaying = NO; // Initialize in a stopped state.
             
             result(@YES);
         }
         else if ([@"feed" isEqualToString:call.method])
         {
-            // setup check
             if (self.mDidSetup == false) {
                 result([FlutterError errorWithCode:@"Setup" message:@"must call setup first" details:nil]);
-                return;
-            }
-
-            if (!self.mIsAppActive && !self.mAllowBackgroundAudio) {
-                @synchronized (self.mSamples) {[self.mSamples setLength:0];}
-                [self.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:@{@"remaining_frames": @(0)}];
-                result(@YES);
                 return;
             }
 
@@ -193,41 +173,36 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             @synchronized (self.mSamples) {
                 [self.mSamples appendData:buffer.data];
             }
-
-            // reset
+            
             self.mDidInvokeFeedCallback = false;
             self.mDidSendZero = false;
 
-            // start
-            OSStatus status = AudioOutputUnitStart(_mAudioUnit);
-            if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioOutputUnitStart failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
-                return;
-            }
-            // MODIFIED: Update playing state when feed starts the unit.
-            self._isPlaying = YES;
-
+            // --- IMPROVEMENT ---
+            // We no longer start the AudioUnit here. The 'feed' method's only job
+            // is to provide data, just like the Android version.
+            
             result(@YES);
         }
-        // ADDED: New 'start' method to resume playback.
         else if ([@"start" isEqualToString:call.method])
         {
+            // --- IMPROVEMENT ---
+            // We no longer call AudioOutputUnitStart. The unit is already running.
+            // We just flip the software flag to allow the RenderCallback to provide data.
             if (self.mAudioUnit != nil && !self._isPlaying) {
-                OSStatus status = AudioOutputUnitStart(self.mAudioUnit);
-                if (status == noErr) {
-                    self._isPlaying = YES;
-                }
+                self._isPlaying = YES;
             }
             result(@YES);
         }
-        // ADDED: New 'stop' method to pause playback.
         else if ([@"stop" isEqualToString:call.method])
         {
+            // --- IMPROVEMENT ---
+            // This is the software gate. We do NOT stop the AudioUnit.
+            // We just set the flag and clear the buffer to stop sound immediately.
+            // This prevents the hardware-induced delay on restart.
             if (self.mAudioUnit != nil && self._isPlaying) {
-                OSStatus status = AudioOutputUnitStop(self.mAudioUnit);
-                if (status == noErr) {
-                    self._isPlaying = NO;
+                self._isPlaying = NO;
+                @synchronized (self.mSamples) {
+                    [self.mSamples setLength:0];
                 }
             }
             result(@YES);
@@ -236,9 +211,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         {
             NSDictionary *args = (NSDictionary*)call.arguments;
             NSNumber *feedThreshold = args[@"feed_threshold"];
-
             self.mFeedThreshold = [feedThreshold intValue];
-
             result(@YES);
         }
         else if([@"release" isEqualToString:call.method])
@@ -254,52 +227,28 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     @catch (NSException *e)
     {
         NSString *stackTrace = [[e callStackSymbols] componentsJoinedByString:@"\n"];
-        NSDictionary *details = @{@"stackTrace": stackTrace};
-        result([FlutterError errorWithCode:@"iosException" message:[e reason] details:details]);
+        result([FlutterError errorWithCode:@"iosException" message:[e reason] details:@{@"stackTrace": stackTrace}]);
     }
 }
 
 - (void)cleanup
 {
     if (_mAudioUnit != nil) {
+        // This is the correct place to fully stop and dispose of the AudioUnit.
+        AudioOutputUnitStop(_mAudioUnit);
         AudioUnitUninitialize(_mAudioUnit);
         AudioComponentInstanceDispose(_mAudioUnit);
         _mAudioUnit = nil;
         self.mDidSetup = false;
-        self._isPlaying = NO; // MODIFIED: Reset playing state on cleanup.
+        self._isPlaying = NO;
     }
     @synchronized (self.mSamples) {
         self.mSamples = [NSMutableData new];
     }
 }
 
-- (void)stopAudioUnit
-{
-    if (_mAudioUnit != nil) {
-        UInt32 isRunning = 0;
-        UInt32 size = sizeof(isRunning);
-        OSStatus status = AudioUnitGetProperty(_mAudioUnit,
-                                            kAudioOutputUnitProperty_IsRunning,
-                                            kAudioUnitScope_Global,
-                                            0,
-                                            &isRunning,
-                                            &size);
-        if (status != noErr) {
-            NSLog(@"AudioUnitGetProperty IsRunning failed. OSStatus: %@", @(status));
-            return;
-        }
-        if (isRunning) {
-            status = AudioOutputUnitStop(_mAudioUnit);
-            if (status != noErr) {
-                NSLog(@"AudioOutputUnitStop failed. OSStatus: %@", @(status));
-            } else {
-                self._isPlaying = NO; // MODIFIED: Update state when buffer underrun stops the unit.
-                NSLog(@"AudioUnit stopped because no more samples");
-            }
-        }
-    }
-}
-
+// --- IMPROVEMENT ---
+// The RenderCallback is the heart of the software gating logic.
 static OSStatus RenderCallback(void *inRefCon,
                                AudioUnitRenderActionFlags *ioActionFlags,
                                const AudioTimeStamp *inTimeStamp,
@@ -309,46 +258,40 @@ static OSStatus RenderCallback(void *inRefCon,
 {
     FlutterPcmSoundPlugin *instance = (__bridge FlutterPcmSoundPlugin *)(inRefCon);
 
-    NSUInteger remainingFrames;
-    BOOL isThresholdEvent = false;
-
     @synchronized (instance.mSamples) {
-        // clear
-        memset(ioData->mBuffers[0].mData, 0, ioData->mBuffers[0].mDataByteSize);
+        // First, check the software gate flag.
+        if (instance._isPlaying && [instance.mSamples length] > 0) {
+            // If playing, copy as much data as we have, up to the buffer size.
+            NSUInteger bytesToCopy = MIN(ioData->mBuffers[0].mDataByteSize, [instance.mSamples length]);
+            memcpy(ioData->mBuffers[0].mData, [instance.mSamples bytes], bytesToCopy);
 
-        NSUInteger bytesToCopy = MIN(ioData->mBuffers[0].mDataByteSize, [instance.mSamples length]);
-        
-        // provide samples
-        memcpy(ioData->mBuffers[0].mData, [instance.mSamples bytes], bytesToCopy);
+            // Remove the copied data from our buffer.
+            NSRange range = NSMakeRange(0, bytesToCopy);
+            [instance.mSamples replaceBytesInRange:range withBytes:NULL length:0];
+            
+            // If we didn't have enough data to fill the buffer, fill the rest with silence.
+            if (bytesToCopy < ioData->mBuffers[0].mDataByteSize) {
+                memset(ioData->mBuffers[0].mData + bytesToCopy, 0, ioData->mBuffers[0].mDataByteSize - bytesToCopy);
+            }
+        } else {
+            // If not playing or no data, provide silence. The AudioUnit keeps running.
+            memset(ioData->mBuffers[0].mData, 0, ioData->mBuffers[0].mDataByteSize);
+        }
 
-        // pop front bytes
-        NSRange range = NSMakeRange(0, bytesToCopy);
-        [instance.mSamples replaceBytesInRange:range withBytes:NULL length:0];
+        // --- Callback logic for requesting more data ---
+        NSUInteger remainingFrames = [instance.mSamples length] / (instance.mNumChannels * sizeof(short));
+        BOOL isThresholdEvent = remainingFrames <= instance.mFeedThreshold && !instance.mDidInvokeFeedCallback;
+        BOOL isZeroCrossingEvent = instance.mDidSendZero == false && remainingFrames == 0;
 
-        remainingFrames = [instance.mSamples length] / (instance.mNumChannels * sizeof(short));
-
-        // should request more frames?
-        isThresholdEvent = remainingFrames <= instance.mFeedThreshold && !instance.mDidInvokeFeedCallback;
+        if (isThresholdEvent || isZeroCrossingEvent) {
+            instance.mDidInvokeFeedCallback = true;
+            instance.mDidSendZero = remainingFrames == 0;
+            NSDictionary *response = @{@"remaining_frames": @(remainingFrames)};
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [instance.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:response];
+            });
+        }
     }
-
-    // stop running, if needed
-    if (remainingFrames == 0) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [instance stopAudioUnit];
-        });
-    }
-
-    BOOL isZeroCrossingEvent = instance.mDidSendZero == false && remainingFrames == 0;
-
-    if (isThresholdEvent || isZeroCrossingEvent) {
-        instance.mDidInvokeFeedCallback = true;
-        instance.mDidSendZero = remainingFrames == 0;
-        NSDictionary *response = @{@"remaining_frames": @(remainingFrames)};
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [instance.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:response];
-        });
-    }
-
     return noErr;
 }
 
