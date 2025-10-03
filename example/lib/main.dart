@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 
@@ -22,7 +24,7 @@ class PcmSoundApp extends StatefulWidget {
 class _PcmSoundAppState extends State<PcmSoundApp> with WidgetsBindingObserver {
   static const int sampleRate = 48000;
   bool _isPlaying = false;
-  bool _isActive = true; 
+  bool _isActive = true;
   int _remainingFrames = 0;
   MajorScale scale = MajorScale(sampleRate: sampleRate, noteDuration: 0.20);
 
@@ -35,7 +37,8 @@ class _PcmSoundAppState extends State<PcmSoundApp> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this); // register observer
 
     FlutterPcmSound.setLogLevel(LogLevel.verbose).onError(_showError);
-    FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: 1).onError(_showError);
+    FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: 1)
+        .onError(_showError);
     FlutterPcmSound.setFeedThreshold(sampleRate ~/ 10).onError(_showError);
     FlutterPcmSound.setFeedCallback(_onFeed);
   }
@@ -69,7 +72,7 @@ class _PcmSoundAppState extends State<PcmSoundApp> with WidgetsBindingObserver {
     // Only feed if playing AND app is active
     if (_isPlaying && _isActive) {
       List<int> frames = scale.generate(periods: 20);
-      await FlutterPcmSound.feed(PcmArrayInt16.fromList(frames))
+      await FlutterPcmSound.feed(Int16List.fromList(frames))
           .onError(_showError);
     }
   }
